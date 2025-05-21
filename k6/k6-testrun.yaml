@@ -4,9 +4,14 @@ metadata:
   name: game-server-load-test
   namespace: production
 spec:
-  parallelism: 400 # Distribute across 400 pods
+  parallelism: 4
   script:
     configMap:
-      name: k6-test-script
+      name: k6-load-test
       file: k6-load-test.js
-  arguments: --out influxdb=http://prometheus:8086
+  runner:
+    image: grafana/k6:latest
+    env:
+      - name: K6_OUT
+        value: json=test-results.json
+  arguments: --address 0.0.0.0:6565

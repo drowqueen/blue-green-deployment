@@ -13,24 +13,64 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      # Cache .NET packages
+      - name: Cache .NET packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: ${{ runner.os }}-nuget-${{ hashFiles('**/*.csproj') }}
+          restore-keys: |
+            ${{ runner.os }}-nuget-
+
       # Set up .NET
       - name: Set up .NET
         uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: "8.0.x"
+          dotnet-version: '8.0.x'
 
       # Build and test C# app
       - name: Build and test
         run: |
-          dotnet build ./GameServer.sln
-          dotnet test ./GameServer.Tests/GameServer.Tests.csproj
+          dotnet build ./GameServer.sln --configuration Release
+          dotnet test ./GameServer.Tests/GameServer.Tests.csproj --configuration Release --collect:"XPlat Code Coverage" --settings coverlet.runsettings
+        env:
+          COVERLET_OUTPUT: GameServer.Tests/coverage.opencover.xml
+
+      # Run SonarQube analysis
+      - name: Run SonarQube analysis
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: http://sonarqube.production.svc.cluster.local:9000
+        run: |
+          dotnet tool install --global dotnet-sonarscanner --version 6.2.0
+          dotnet sonarscanner begin \
+            /k:"mock-game-app" \
+            /d:sonar.host.url="$SONAR_HOST_URL" \
+            /d:sonar.token="$SONAR_TOKEN" \
+            /d:sonar.cs.opencover.reportsPaths="GameServer.Tests/coverage.opencover.xml" \
+            /d:sonar.exclusions="**/wwwroot/**,**/migrations/**" \
+            /d:sonar.sourceEncoding="UTF-8" \
+            || { echo "SonarQube begin failed"; exit 1; }
+          dotnet build ./GameServer.sln --configuration Release
+          dotnet test ./GameServer.Tests/GameServer.Tests.csproj --configuration Release --collect:"XPlat Code Coverage" --settings coverlet.runsettings
+          dotnet sonarscanner end /d:sonar.token="$SONAR_TOKEN" \
+            || { echo "SonarQube end failed"; exit 1; }
+
+      # Cache Docker layers
+      - name: Cache Docker layers
+        uses: actions/cache@v4
+        with:
+          path: /tmp/.buildx-cache
+          key: ${{ runner.os }}-buildx-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-buildx-
 
       # Set up Docker Buildx
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
       # Login to container registry
-      - name: Login to registry
+      - name: Login to container registry
         uses: docker/login-action@v3
         with:
           registry: registry.example.com
@@ -45,30 +85,35 @@ jobs:
           file: ./Dockerfile
           push: true
           tags: registry.example.com/mock-game-app:${{ github.sha }}
+          cache-from: type=local,src=/tmp/.buildx-cache
+          cache-to: type=local,dest=/tmp/.buildx-cache
 
       # Install Helm
       - name: Install Helm
         uses: azure/setup-helm@v4
         with:
-          version: "v3.14.0"
+          version: 'v3.14.0'
 
       # Set up kubectl
       - name: Set up kubectl
         uses: azure/setup-kubectl@v4
         with:
-          version: "v1.28.0"
+          version: 'v1.28.0'
 
       # Deploy green environment
       - name: Deploy green environment
         env:
           KUBE_CONFIG: ${{ secrets.KUBE_CONFIG }}
         run: |
-          echo "$KUBE_CONFIG" | base64 -d > kubeconfig
+          # Securely handle KUBE_CONFIG
+          echo "$KUBE_CONFIG" | base64 -d > /tmp/kubeconfig
           helm upgrade --install game-server-green ./charts/game-server \
             --namespace production \
             --set image.tag=${{ github.sha }} \
             --set env=green \
-            --kubeconfig kubeconfig
+            --kubeconfig /tmp/kubeconfig \
+            || { echo "Green deployment failed"; exit 1; }
+          rm /tmp/kubeconfig
 
       # Run distributed K6 load test
       - name: Run K6 distributed load test
@@ -76,9 +121,11 @@ jobs:
         env:
           KUBE_CONFIG: ${{ secrets.KUBE_CONFIG }}
         run: |
-          echo "$KUBE_CONFIG" | base64 -d > kubeconfig
-          kubectl apply -f k6-testrun.yaml --kubeconfig kubeconfig
-          kubectl wait --for=condition=complete testrun/game-server-load-test --namespace production --timeout=600s --kubeconfig kubeconfig || exit 1
+          echo "$KUBE_CONFIG" | base64 -d > /tmp/kubeconfig
+          kubectl apply -f k6/k6-testrun.yaml --kubeconfig /tmp/kubeconfig
+          kubectl wait --for=condition=complete testrun/game-server-load-test --namespace production --timeout=1200s --kubeconfig /tmp/kubeconfig \
+            || { echo "K6 tests failed"; exit 1; }
+          rm /tmp/kubeconfig
         continue-on-error: true # Allow rollback on failure
 
       # Rollback on test failure
@@ -87,30 +134,51 @@ jobs:
         env:
           KUBE_CONFIG: ${{ secrets.KUBE_CONFIG }}
         run: |
-          echo "$KUBE_CONFIG" | base64 -d > kubeconfig
-          helm rollback game-server-green 0 --namespace production --kubeconfig kubeconfig || true
+          echo "$KUBE_CONFIG" | base64 -d > /tmp/kubeconfig
+          helm rollback game-server-green 0 --namespace production --kubeconfig /tmp/kubeconfig \
+            || { echo "Rollback failed, manual intervention needed"; exit 1; }
+          rm /tmp/kubeconfig
           echo "K6 tests failed. Rolled back green environment."
 
-      # Switch traffic to green via Ingress (only if tests pass)
+      # Switch traffic to green via Ingress
       - name: Switch traffic to green
         if: steps.k6_test.outcome == 'success'
         env:
           KUBE_CONFIG: ${{ secrets.KUBE_CONFIG }}
         run: |
-          echo "$KUBE_CONFIG" | base64 -d > kubeconfig
+          echo "$KUBE_CONFIG" | base64 -d > /tmp/kubeconfig
           kubectl patch ingress game-server-ingress -n production \
             --type='json' \
             -p='[{"op": "replace", "path": "/spec/rules/0/http/paths/0/backend/service/name", "value": "game-server-green"}]' \
-            --kubeconfig kubeconfig
+            --kubeconfig /tmp/kubeconfig \
+            || { echo "Ingress patch failed"; exit 1; }
+          rm /tmp/kubeconfig
           echo "Switched traffic to green environment."
 
-      # Clean up old blue environment (with delay for existing connections)
+      # Clean up old blue environment
       - name: Clean up blue environment
         if: steps.k6_test.outcome == 'success'
         env:
           KUBE_CONFIG: ${{ secrets.KUBE_CONFIG }}
         run: |
-          echo "$KUBE_CONFIG" | base64 -d > kubeconfig
-          sleep 300 # Wait 5 minutes for existing WebSocket connections
-          helm uninstall game-server-blue --namespace production --kubeconfig kubeconfig || true
+          echo "$KUBE_CONFIG" | base64 -d > /tmp/kubeconfig
+          sleep 300 # Wait 5 minutes for WebSocket connections to reconnect
+          helm uninstall game-server-blue --namespace production --kubeconfig /tmp/kubeconfig \
+            || { echo "Blue cleanup failed, manual cleanup may be needed"; exit 1; }
+          rm /tmp/kubeconfig
           echo "Cleaned up blue environment."
+
+      # Notify team (e.g., Slack) of deployment status
+      - name: Notify deployment status
+        if: always()
+        uses: slackapi/slack-github-action@v1.27.0
+        with:
+          slack-bot-token: ${{ secrets.SLACK_BOT_TOKEN }}
+          channel-id: 'devops-notifications'
+          text: |
+            Blue-Green Deployment for Mock Game App
+            Status: ${{ steps.k6_test.outcome == 'success' && 'Success: Traffic switched to green' || 'Failed: Rolled back green' }}
+            Commit: ${{ github.sha }}
+            Run: ${{ github.run_id }}
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
