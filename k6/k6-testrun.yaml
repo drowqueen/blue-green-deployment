@@ -1,0 +1,12 @@
+apiVersion: k6.io/v1alpha1
+kind: TestRun
+metadata:
+  name: game-server-load-test
+  namespace: production
+spec:
+  parallelism: 400 # Distribute across 400 pods
+  script:
+    configMap:
+      name: k6-test-script
+      file: k6-load-test.js
+  arguments: --out influxdb=http://prometheus:8086

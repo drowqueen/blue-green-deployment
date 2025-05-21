@@ -1,0 +1,5 @@
+apiVersion: v2
+name: game-server
+description: Helm chart for mock mobile game server with blue-green deployment
+version: 0.1.0
+appVersion: "1.0"

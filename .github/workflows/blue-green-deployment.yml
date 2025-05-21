@@ -1,0 +1,116 @@
+name: Blue-Green Deployment for Mock Game App
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  blue-green-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      # Checkout code
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Set up .NET
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      # Build and test C# app
+      - name: Build and test
+        run: |
+          dotnet build ./GameServer.sln
+          dotnet test ./GameServer.Tests/GameServer.Tests.csproj
+
+      # Set up Docker Buildx
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Login to container registry
+      - name: Login to registry
+        uses: docker/login-action@v3
+        with:
+          registry: registry.example.com
+          username: ${{ secrets.REGISTRY_USERNAME }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
+
+      # Build and push Docker image
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: registry.example.com/mock-game-app:${{ github.sha }}
+
+      # Install Helm
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: "v3.14.0"
+
+      # Set up kubectl
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: "v1.28.0"
+
+      # Deploy green environment
+      - name: Deploy green environment
+        env:
+          KUBE_CONFIG: ${{ secrets.KUBE_CONFIG }}
+        run: |
+          echo "$KUBE_CONFIG" | base64 -d > kubeconfig
+          helm upgrade --install game-server-green ./charts/game-server \
+            --namespace production \
+            --set image.tag=${{ github.sha }} \
+            --set env=green \
+            --kubeconfig kubeconfig
+
+      # Run distributed K6 load test
+      - name: Run K6 distributed load test
+        id: k6_test
+        env:
+          KUBE_CONFIG: ${{ secrets.KUBE_CONFIG }}
+        run: |
+          echo "$KUBE_CONFIG" | base64 -d > kubeconfig
+          kubectl apply -f k6-testrun.yaml --kubeconfig kubeconfig
+          kubectl wait --for=condition=complete testrun/game-server-load-test --namespace production --timeout=600s --kubeconfig kubeconfig || exit 1
+        continue-on-error: true # Allow rollback on failure
+
+      # Rollback on test failure
+      - name: Rollback green on test failure
+        if: steps.k6_test.outcome == 'failure'
+        env:
+          KUBE_CONFIG: ${{ secrets.KUBE_CONFIG }}
+        run: |
+          echo "$KUBE_CONFIG" | base64 -d > kubeconfig
+          helm rollback game-server-green 0 --namespace production --kubeconfig kubeconfig || true
+          echo "K6 tests failed. Rolled back green environment."
+
+      # Switch traffic to green via Ingress (only if tests pass)
+      - name: Switch traffic to green
+        if: steps.k6_test.outcome == 'success'
+        env:
+          KUBE_CONFIG: ${{ secrets.KUBE_CONFIG }}
+        run: |
+          echo "$KUBE_CONFIG" | base64 -d > kubeconfig
+          kubectl patch ingress game-server-ingress -n production \
+            --type='json' \
+            -p='[{"op": "replace", "path": "/spec/rules/0/http/paths/0/backend/service/name", "value": "game-server-green"}]' \
+            --kubeconfig kubeconfig
+          echo "Switched traffic to green environment."
+
+      # Clean up old blue environment (with delay for existing connections)
+      - name: Clean up blue environment
+        if: steps.k6_test.outcome == 'success'
+        env:
+          KUBE_CONFIG: ${{ secrets.KUBE_CONFIG }}
+        run: |
+          echo "$KUBE_CONFIG" | base64 -d > kubeconfig
+          sleep 300 # Wait 5 minutes for existing WebSocket connections
+          helm uninstall game-server-blue --namespace production --kubeconfig kubeconfig || true
+          echo "Cleaned up blue environment."

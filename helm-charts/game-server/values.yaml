@@ -1,0 +1,32 @@
+image:
+  repository: registry.example.com/mock-game-app
+  tag: latest
+  pullPolicy: IfNotPresent
+
+env: blue # Overridden as 'blue' or 'green' during deployment
+
+replicaCount: 2
+
+service:
+  type: ClusterIP
+  port: 80
+
+ingress:
+  enabled: true
+  hostname: game.demo.local
+  path: /
+  initialBackend: game-server-blue # Initial traffic to blue
+
+resources:
+  limits:
+    cpu: "500m"
+    memory: "512Mi"
+  requests:
+    cpu: "200m"
+    memory: "256Mi"
+
+hpa:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 70
