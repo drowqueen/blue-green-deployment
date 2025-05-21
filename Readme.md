@@ -12,6 +12,7 @@ The GitHub Actions workflow (`.github/workflows/blue-green-deploy.yml`) automate
 - **Secrets**: `SONAR_TOKEN`, `REGISTRY_USERNAME`, `REGISTRY_PASSWORD`, `KUBE_CONFIG`, `SLACK_BOT_TOKEN` in GitHub Secrets.
 - **Cluster**: `eks-game-demo` with K6 Operator, NGINX Ingress Controller, Prometheus, Grafana.
 - **Files**: Ensure `coverlet.runsettings` is in `GameServer.Tests/` for SonarQube coverage.
+- **ECR**: Replace <account-id> with your AWS account ID and us-west-2 with your EKS region in the workflow.
 
 
 ## Assumptions
